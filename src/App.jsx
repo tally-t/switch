@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 //  API calls — all go through Vercel proxies (keys stay server-side)
 // ─────────────────────────────────────────────────────────────────────────────
 async function searchGames(q) {
-  if (!q || q.length < 2) return [];
+  if (!q || q.length < 1) return [];
   const r = await fetch(`/api/rawg?q=${encodeURIComponent(q)}&platforms=7&page_size=8`);
   if (!r.ok) throw new Error(`Search failed ${r.status}`);
   const data = await r.json();
@@ -124,12 +124,12 @@ export default function App() {
 
   // ── RAWG search ──────────────────────────────────────────────────────────
   const doSearch = useCallback(async (q) => {
-    if (!q || q.length < 2) { setSearchResults([]); return; }
+    if (!q || q.length < 1) { setSearchResults([]); return; }
     setSearching(true); setSearchErr("");
     try {
       setSearchResults(await searchGames(q));
     } catch (e) {
-      setSearchErr(e.message.includes("RAWG_API_KEY") ? "RAWG_API_KEY ยังไม่ได้ตั้งค่าใน Vercel" : "ค้นหาไม่ได้ — ตรวจสอบ Vercel ENV");
+      setSearchErr(e.message.includes("RAWG_API_KEY") ? "RAWG_API_KEY ยังไม่ได้ตั้งค่าใน Vercel" : "ค้นหาไม่ได้ ลองใหม่");
       setSearchResults([]);
     }
     setSearching(false);
@@ -137,7 +137,7 @@ export default function App() {
 
   useEffect(() => {
     clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => doSearch(searchQ), 500);
+    debounceRef.current = setTimeout(() => doSearch(searchQ), 300);
     return () => clearTimeout(debounceRef.current);
   }, [searchQ, doSearch]);
 
@@ -543,27 +543,54 @@ export default function App() {
           <div onClick={e=>e.stopPropagation()} className="s" style={{ background:"#0d0b1a", borderRadius:"24px 24px 0 0", padding:"22px 20px 36px", width:"100%", border:"1px solid rgba(99,102,241,.2)", maxHeight:"92vh", overflowY:"auto" }}>
             <div style={{ fontFamily:"'Syne',sans-serif", fontSize:18, fontWeight:800, marginBottom:16 }}>{editGame?"✏️ แก้ไขเกม":"🎮 เพิ่มเกมใหม่"}</div>
 
-            {/* RAWG search */}
-            <Label>ค้นหาเกม (ดึงจาก Nintendo Switch database)</Label>
-            <div style={{ position:"relative", marginBottom: searchResults.length>0?0:12 }}>
-              <input value={searchQ} onChange={e=>{setSearchQ(e.target.value);setNewGame(p=>({...p,title:e.target.value}));}}
-                placeholder="พิมพ์ชื่อเกม เช่น Mario, Zelda..."
-                style={{ width:"100%", background:"rgba(255,255,255,.07)", border:"1px solid rgba(255,255,255,.12)", borderRadius:12, padding:"11px 40px 11px 14px", fontSize:13, color:"#eef0f8" }}/>
-              {searching && <div className="p" style={{ position:"absolute", right:12, top:"50%", transform:"translateY(-50%)", fontSize:11, color:"#666" }}>🔍</div>}
+            {/* Game search */}
+            <Label>ค้นหาเกม</Label>
+            <div style={{ position:"relative" }}>
+              <input
+                value={searchQ}
+                onChange={e => { setSearchQ(e.target.value); setNewGame(p => ({ ...p, title: e.target.value })); }}
+                placeholder="พิมพ์ชื่อเกม เช่น Mario, Zelda, Pokemon..."
+                autoComplete="off"
+                style={{ width:"100%", background:"rgba(255,255,255,.07)", border:`1px solid ${searchResults.length>0?"rgba(99,102,241,.5)":"rgba(255,255,255,.12)"}`, borderRadius: searchResults.length>0?"12px 12px 0 0":"12px", padding:"12px 44px 12px 14px", fontSize:13, color:"#eef0f8", transition:"border .15s" }}
+              />
+              <div style={{ position:"absolute", right:12, top:"50%", transform:"translateY(-50%)", fontSize:14, pointerEvents:"none" }}>
+                {searching ? <span className="p">⏳</span> : searchQ ? "🔍" : "🎮"}
+              </div>
             </div>
-            {searchErr && <div style={{ fontSize:11, color:"#f87171", marginBottom:8 }}>{searchErr}</div>}
-            {searchResults.length>0 && (
-              <div style={{ background:"#13111f", border:"1px solid rgba(99,102,241,.25)", borderRadius:12, marginBottom:12, overflow:"hidden", maxHeight:220, overflowY:"auto" }}>
-                {searchResults.map(g=>(
-                  <div key={g.rawgId} className="b" onClick={()=>pickGame(g)} style={{ display:"flex", gap:10, padding:"9px 12px", borderBottom:"1px solid rgba(255,255,255,.05)", alignItems:"center" }}>
-                    {g.cover && <img src={g.cover} alt="" style={{ width:40, height:28, objectFit:"cover", borderRadius:6, flexShrink:0 }}/>}
+
+            {/* Dropdown */}
+            {(searchResults.length > 0 || (searching && searchQ)) && (
+              <div style={{ background:"#13111f", border:"1px solid rgba(99,102,241,.35)", borderTop:"none", borderRadius:"0 0 12px 12px", marginBottom:12, overflow:"hidden", maxHeight:260, overflowY:"auto", boxShadow:"0 8px 24px rgba(0,0,0,.5)" }}>
+                {searching && searchResults.length === 0 && (
+                  <div style={{ padding:"12px 14px", fontSize:12, color:"#555", display:"flex", alignItems:"center", gap:8 }}>
+                    <span className="p">🔍</span> กำลังค้นหา...
+                  </div>
+                )}
+                {searchResults.map((g, i) => (
+                  <div key={g.rawgId || i} className="b" onClick={() => pickGame(g)}
+                    style={{ display:"flex", gap:10, padding:"10px 12px", borderBottom:"1px solid rgba(255,255,255,.05)", alignItems:"center", background:i%2===0?"transparent":"rgba(255,255,255,.015)" }}>
+                    {g.cover
+                      ? <img src={g.cover} alt="" style={{ width:44, height:30, objectFit:"cover", borderRadius:6, flexShrink:0 }} onError={e=>e.target.style.display="none"}/>
+                      : <div style={{ width:44, height:30, borderRadius:6, background:"rgba(99,102,241,.15)", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0, fontSize:16 }}>🎮</div>
+                    }
                     <div style={{ flex:1, minWidth:0 }}>
-                      <div style={{ fontSize:12, fontWeight:700, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{g.title}</div>
-                      <div style={{ fontSize:10, color:"#666", marginTop:2 }}>{g.released} · {g.genres?.join(", ")}</div>
+                      <div style={{ fontSize:13, fontWeight:700, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{g.title}</div>
+                      <div style={{ fontSize:10, color:"#666", marginTop:2 }}>
+                        {[g.released, g.genres?.slice(0,2).join(", ")].filter(Boolean).join(" · ")}
+                      </div>
                     </div>
-                    {g.rating && <div style={{ fontSize:10, color:"#f59e0b", flexShrink:0 }}>⭐{g.rating}</div>}
+                    {g.rating && <div style={{ fontSize:11, color:"#f59e0b", flexShrink:0 }}>⭐{g.rating}</div>}
                   </div>
                 ))}
+                {!searching && searchResults.length === 0 && searchQ.length > 0 && (
+                  <div style={{ padding:"12px 14px", fontSize:12, color:"#555" }}>ไม่พบเกม "{searchQ}"</div>
+                )}
+              </div>
+            )}
+
+            {searchErr && (
+              <div style={{ fontSize:11, color:"#f87171", marginBottom:8, padding:"6px 10px", background:"rgba(248,113,113,.08)", borderRadius:8 }}>
+                ⚠️ {searchErr}
               </div>
             )}
 
