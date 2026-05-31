@@ -1,609 +1,729 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 
-// ─── API LAYER ────────────────────────────────────────────────────────────────
-// All calls go through /api/eshop (Vercel proxy → ec.nintendo.com)
-// Response shape from Nintendo:
-//   { contents: [{ formal_name, hero_banner_url, id, release_date_on_eshop, ... }], total, length, offset }
-// Price endpoint:
-//   { prices: [{ title_id, sales_status, regular_price: { raw_value }, discount_price: { raw_value } }] }
+// ─────────────────────────────────────────────────────────────────────────────
+//  API calls — all go through Vercel proxies (keys stay server-side)
+// ─────────────────────────────────────────────────────────────────────────────
+async function searchGames(q) {
+  if (!q || q.length < 2) return [];
+  const r = await fetch(`/api/rawg?q=${encodeURIComponent(q)}&platforms=7&page_size=8`);
+  if (!r.ok) throw new Error(`Search failed ${r.status}`);
+  const data = await r.json();
+  if (data.error) throw new Error(data.error);
+  return (data.results || []).map(g => ({
+    rawgId:  g.id,
+    title:   g.name,
+    cover:   g.background_image || null,
+    released: g.released?.slice(0, 4) || "",
+    rating:  g.rating ? g.rating.toFixed(1) : null,
+    genres:  (g.genres || []).map(x => x.name).slice(0, 2),
+  }));
+}
 
-const GENRE_EMOJI = {
-  "Action":       "⚔️",
-  "Adventure":    "🗺️",
-  "RPG":          "🧙",
-  "Platformer":   "🎮",
-  "Racing":       "🏎️",
-  "Fighting":     "🥊",
-  "Shooter":      "🎯",
-  "Puzzle":       "🧩",
-  "Sports":       "⚽",
-  "Simulation":   "🏗️",
-  "Music":        "🎵",
-  "Strategy":     "♟️",
+async function fetchRates() {
+  const r = await fetch("/api/rates");
+  if (!r.ok) throw new Error("rates failed");
+  return r.json(); // { base:"THB", rates:{ USD:36.5, JPY:0.245, ... } }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Constants
+// ─────────────────────────────────────────────────────────────────────────────
+const ESHOP_ZONES   = ["TH","JP","US","EU","MX","HK","SG","AU","GB","KR","Other"];
+const PHYS_REGIONS  = ["Asia","Japan","US/Canada","Europe","Multi-region","Other"];
+
+// Currency → symbol + ISO code for conversion
+const ZONE_CURRENCY = {
+  TH:"THB", JP:"JPY", US:"USD", EU:"EUR", MX:"MXN",
+  HK:"HKD", SG:"SGD", AU:"AUD", GB:"GBP", KR:"KRW", Other:"USD",
 };
-const GENRES = ["All", "Action", "Adventure", "RPG", "Platformer", "Racing", "Fighting", "Shooter", "Puzzle", "Sports", "Music", "Strategy"];
-const PAGE_SIZE = 30;
-const fmt = (n) => `฿${Number(n).toLocaleString("th-TH")}`;
+const CURRENCY_SYMBOL = {
+  THB:"฿", JPY:"¥", USD:"$", EUR:"€", MXN:"MX$",
+  HKD:"HK$", SGD:"S$", AUD:"A$", GBP:"£", KRW:"₩",
+};
+const ALL_CURRENCIES = Object.keys(CURRENCY_SYMBOL);
 
-// Fetch game list from Nintendo eShop TH
-async function fetchGames(type = "sales", offset = 0) {
-  const res = await fetch(`/api/eshop?type=${type}&count=${PAGE_SIZE}&offset=${offset}`);
-  if (!res.ok) throw new Error(`API error ${res.status}`);
-  return res.json();
-  // Returns: { contents: [...], total, length, offset }
-}
+const ZONE_COLOR = {
+  TH:"#dc2626",JP:"#e879f9",US:"#3b82f6",EU:"#10b981",MX:"#f97316",
+  HK:"#f59e0b",SG:"#8b5cf6",AU:"#06b6d4",GB:"#ec4899",KR:"#84cc16",Other:"#94a3b8",
+};
+const TYPE_COLOR = { physical:"#f59e0b", digital:"#60a5fa" };
 
-// Fetch prices for a batch of nsuids
-async function fetchPrices(nsuids) {
-  if (!nsuids.length) return [];
-  const ids = nsuids.join(",");
-  const res = await fetch(`/api/eshop?type=prices&ids=${ids}`);
-  if (!res.ok) return [];
-  const data = await res.json();
-  return data.prices || [];
-  // Returns: [{ title_id, sales_status, regular_price: { raw_value }, discount_price: { raw_value } }]
-}
+const ACCOUNT_PRESETS = [
+  { name:"บัญชีหลัก TH", tag:"Main TH", color:"#dc2626" },
+  { name:"บัญชี JP",      tag:"JP Shop", color:"#e879f9" },
+  { name:"บัญชี US",      tag:"US Shop", color:"#3b82f6" },
+  { name:"Family",         tag:"Family",  color:"#10b981" },
+];
 
-// Search games
-async function searchGames(q, offset = 0) {
-  const res = await fetch(`/api/eshop?type=search&q=${encodeURIComponent(q)}&count=${PAGE_SIZE}&offset=${offset}`);
-  if (!res.ok) throw new Error(`Search error ${res.status}`);
-  return res.json();
-}
+const fmtTHB = (n) => `฿${Math.round(n).toLocaleString("th-TH")}`;
+const fmtAmt = (n, sym) => `${sym||"฿"}${Number(n).toLocaleString()}`;
+const LS = {
+  get: k => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
+  set: (k, v) => localStorage.setItem(k, JSON.stringify(v)),
+};
 
-// Map Nintendo/Algolia game object → our app's shape
-// Algolia response embeds _msrp/_sale/_on_sale directly — no separate price fetch needed
-function mapGame(item, priceMap = {}) {
-  const nsuid = item.nsuid_txt?.[0] || item.id?.toString() || "";
+const EMPTY_GAME = {
+  title:"", type:"physical", eshopZone:"TH", physRegion:"Asia",
+  buyPrice:"", currency:"THB", accountId:"", condition:"new",
+  bought:"", rawgId:null, cover:null, genres:[], released:"", rating:null, notes:"",
+};
 
-  // Prefer embedded Algolia prices; fall back to separate price API map
-  let msrp, sale, onSale;
-  if (item._msrp != null) {
-    msrp   = item._msrp;
-    sale   = item._sale;
-    onSale = item._on_sale;
-  } else {
-    const price = priceMap[nsuid] || {};
-    msrp   = price.regular_price  ? parseInt(price.regular_price.raw_value)  : 0;
-    sale   = price.discount_price ? parseInt(price.discount_price.raw_value) : null;
-    onSale = price.sales_status === "onsale" && sale != null;
-  }
-
-  const tags  = item.tags || [];
-  const genre = tags.find(t => GENRES.includes(t)) || "Action";
-
-  return {
-    id:         nsuid || item.id,
-    nsuid,
-    title:      item.formal_name || "Unknown",
-    genre,
-    emoji:      GENRE_EMOJI[genre] || "🎮",
-    banner:     item.hero_banner_url || null,
-    released:   item.release_date_on_eshop || "",
-    msrp:       msrp || 0,
-    sale_price: onSale ? sale : null,
-    on_sale:    !!onSale,
-    rating:     item.star_rating_info?.average_rating || null,
-  };
-}
-
-// ─── AI ADVICE ────────────────────────────────────────────────────────────────
-async function getAIAdvice(game, budget) {
-  const price = game.sale_price || game.msrp;
-  const prompt = `Budget gaming advisor for Thai Nintendo Switch 2 eShop players.
-Game: "${game.title}" (${game.genre})
-eShop TH price: ฿${price}${game.on_sale ? ` SALE! (ลดจาก ฿${game.msrp} ประหยัด ฿${game.msrp - game.sale_price})` : " (ราคาปกติ)"}
-Monthly budget: ฿${budget}
-
-2 sentences max. Thai gamer slang + English. Start with "🟢 ซื้อเลย!" or "🟡 รอก่อน!"`;
-
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      messages: [{ role: "user", content: prompt }]
-    })
-  });
-  const data = await res.json();
-  return data.content?.find(b => b.type === "text")?.text || "ดูสถานการณ์ก่อนนะ!";
-}
-
-// ─── LINE SEND ────────────────────────────────────────────────────────────────
-async function sendLineMessage(token, games) {
-  const saleGames = games.filter(g => g.on_sale);
-  const text = saleGames.length
-    ? `🎮 Switch2 eShop TH — ดีลวันนี้!\n\n${saleGames.slice(0, 10).map(g =>
-        `${g.emoji} ${g.title}\n฿${g.msrp} → ฿${g.sale_price} (ประหยัด ฿${g.msrp - g.sale_price})`
-      ).join("\n\n")}\n\nเปิดแอปดูดีลทั้งหมด!`
-    : "🎮 Switch2 TH: ยังไม่มีดีลตอนนี้ จะแจ้งทันทีที่มีราคาลด!";
-
-  await fetch("https://api.line.me/v2/bot/message/broadcast", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${token}`,
-    },
-    body: JSON.stringify({ messages: [{ type: "text", text }] }),
-  });
-}
-
-// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [games, setGames]           = useState([]);
-  const [total, setTotal]           = useState(0);
-  const [offset, setOffset]         = useState(0);
-  const [loading, setLoading]       = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [mode, setMode]             = useState("sales"); // sales | new | ranking
-  const [searchQ, setSearchQ]       = useState("");
-  const [debouncedQ, setDebouncedQ] = useState("");
-  const [genre, setGenre]           = useState("All");
-  const [budget, setBudget]         = useState(3000);
-  const [tempBudget, setTempBudget] = useState("3000");
-  const [wishlist, setWishlist]     = useState(() => {
-    try { return JSON.parse(localStorage.getItem("sw2_wish") || "[]"); } catch { return []; }
-  });
-  const [lineAlerts, setLineAlerts] = useState(() => {
-    try { return JSON.parse(localStorage.getItem("sw2_alerts") || "[]"); } catch { return []; }
-  });
-  const [lineToken, setLineToken]   = useState(() => localStorage.getItem("sw2_token") || "");
-  const [tab, setTab]               = useState("deals");
-  const [aiAdvice, setAiAdvice]     = useState({});
-  const [aiLoading, setAiLoading]   = useState(null);
-  const [expanded, setExpanded]     = useState(null);
-  const [lineSending, setLineSending] = useState(false);
-  const [showLineModal, setShowLineModal] = useState(false);
-  const [toast, setToast]           = useState(null);
-  const [error, setError]           = useState(null);
+  const [accounts,   setAccounts]   = useState(() => LS.get("gvt_accounts_v3") || []);
+  const [collection, setCollection] = useState(() => LS.get("gvt_games_v3")    || []);
+  const [rates,      setRates]      = useState(null);   // { rates: { USD:36.5, ... } }
+  const [ratesAge,   setRatesAge]   = useState(null);
+  const [ratesErr,   setRatesErr]   = useState(false);
 
-  // Persist wishlist + alerts
-  useEffect(() => { localStorage.setItem("sw2_wish", JSON.stringify(wishlist)); }, [wishlist]);
-  useEffect(() => { localStorage.setItem("sw2_alerts", JSON.stringify(lineAlerts)); }, [lineAlerts]);
-  useEffect(() => { localStorage.setItem("sw2_token", lineToken); }, [lineToken]);
+  const [tab,         setTab]        = useState("collection");
+  const [showAddGame, setShowAddGame] = useState(false);
+  const [editGame,    setEditGame]    = useState(null);
+  const [newGame,     setNewGame]     = useState({ ...EMPTY_GAME });
+  const [showAddAcc,  setShowAddAcc]  = useState(false);
+  const [newAcc,      setNewAcc]      = useState({ id:"", name:"", tag:"", color:"#6366f1" });
 
-  // Debounce search
+  const [filterAcc,  setFilterAcc]  = useState("all");
+  const [filterType, setFilterType] = useState("all");
+  const [sortBy,     setSortBy]     = useState("bought");
+  const [toast,      setToast]      = useState(null);
+
+  // RAWG search
+  const [searchQ,       setSearchQ]       = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const [searching,     setSearching]     = useState(false);
+  const [searchErr,     setSearchErr]     = useState("");
+  const debounceRef = useRef(null);
+
+  // Persist
+  useEffect(() => { LS.set("gvt_games_v3",    collection); }, [collection]);
+  useEffect(() => { LS.set("gvt_accounts_v3", accounts);   }, [accounts]);
+
+  // Load exchange rates on mount
   useEffect(() => {
-    const t = setTimeout(() => setDebouncedQ(searchQ), 600);
-    return () => clearTimeout(t);
-  }, [searchQ]);
+    fetchRates()
+      .then(d => { setRates(d); setRatesAge(d.updated); })
+      .catch(() => setRatesErr(true));
+  }, []);
 
-  // Load on mount and when mode/search changes
-  useEffect(() => { load(0, true); }, [mode, debouncedQ]);
-
-  const showToast = (msg, color = "#eab308") => {
+  const showToast = (msg, color="#eab308") => {
     setToast({ msg, color });
-    setTimeout(() => setToast(null), 3000);
+    setTimeout(() => setToast(null), 2800);
   };
 
-  async function load(off = 0, reset = false) {
-    if (off === 0) setLoading(true); else setLoadingMore(true);
-    setError(null);
+  // ── Currency conversion helper ───────────────────────────────────────────
+  // Convert any amount+currency → THB using live rates
+  const toTHB = useCallback((amount, iso) => {
+    if (!amount) return 0;
+    if (iso === "THB" || !iso) return parseFloat(amount);
+    if (!rates?.rates) return parseFloat(amount); // fallback: treat as THB
+    const rate = rates.rates[iso];
+    if (!rate) return parseFloat(amount);
+    return parseFloat(amount) * rate;
+  }, [rates]);
+
+  // ── RAWG search ──────────────────────────────────────────────────────────
+  const doSearch = useCallback(async (q) => {
+    if (!q || q.length < 2) { setSearchResults([]); return; }
+    setSearching(true); setSearchErr("");
     try {
-      // 1. Fetch game list
-      const listData = debouncedQ
-        ? await searchGames(debouncedQ, off)
-        : await fetchGames(mode, off);
-
-      const items = listData.contents || [];
-      const totalCount = listData.total || items.length;
-
-      // 2. Prices are now embedded in Algolia response (_msrp, _sale, _on_sale)
-      // Only fall back to separate price fetch if none have embedded prices
-      const needsPriceFetch = items.length > 0 && items[0]._msrp == null;
-      let priceMap = {};
-      if (needsPriceFetch) {
-        const nsuids = items.map(g => g.nsuid_txt?.[0] || g.id?.toString()).filter(Boolean);
-        const prices = await fetchPrices(nsuids);
-        for (const p of prices) priceMap[p.title_id?.toString()] = p;
-      }
-
-      // 3. Map to our shape
-      const mapped = items.map(item => mapGame(item, priceMap));
-
-      setTotal(totalCount);
-      setOffset(off);
-      if (reset) setGames(mapped);
-      else setGames(prev => [...prev, ...mapped]);
+      setSearchResults(await searchGames(q));
     } catch (e) {
-      const msg = e.message?.includes("502")
-        ? "Nintendo API ไม่ตอบสนอง — ลองกด 🔄 อีกครั้ง"
-        : e.message;
-      setError(msg);
-      showToast("❌ " + msg, "#f87171");
+      setSearchErr(e.message.includes("RAWG_API_KEY") ? "RAWG_API_KEY ยังไม่ได้ตั้งค่าใน Vercel" : "ค้นหาไม่ได้ — ตรวจสอบ Vercel ENV");
+      setSearchResults([]);
     }
-    setLoading(false);
-    setLoadingMore(false);
-  }
+    setSearching(false);
+  }, []);
 
-  const loadMore = () => load(offset + PAGE_SIZE, false);
+  useEffect(() => {
+    clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => doSearch(searchQ), 500);
+    return () => clearTimeout(debounceRef.current);
+  }, [searchQ, doSearch]);
 
-  const toggleWishlist = (id) => {
-    const has = wishlist.includes(id);
-    setWishlist(p => has ? p.filter(x => x !== id) : [...p, id]);
-    showToast(has ? "ลบออกจาก Wishlist แล้ว" : "✅ เพิ่ม Wishlist แล้ว!");
+  const pickGame = (g) => {
+    setNewGame(p => ({ ...p, title:g.title, rawgId:g.rawgId, cover:g.cover, genres:g.genres, released:g.released, rating:g.rating }));
+    setSearchQ(g.title); setSearchResults([]);
   };
 
-  const toggleAlert = (id) => {
-    const has = lineAlerts.includes(id);
-    setLineAlerts(p => has ? p.filter(x => x !== id) : [...p, id]);
-    showToast(has ? "🔕 ปิดแจ้งเตือน" : "🔔 เปิดแจ้งเตือนแล้ว!", "#4ade80");
+  // ── Account CRUD ─────────────────────────────────────────────────────────
+  const addAccount = () => {
+    if (!newAcc.name.trim()) return;
+    const acc = { ...newAcc, id: Date.now().toString() };
+    setAccounts(p => [...p, acc]);
+    setNewAcc({ id:"", name:"", tag:"", color:"#6366f1" });
+    setShowAddAcc(false);
+    showToast("✅ เพิ่ม Account แล้ว!", "#4ade80");
   };
 
-  const askAI = async (game) => {
-    setAiLoading(game.id);
-    try {
-      const advice = await getAIAdvice(game, budget);
-      setAiAdvice(p => ({ ...p, [game.id]: advice }));
-    } catch {
-      setAiAdvice(p => ({ ...p, [game.id]: game.on_sale ? "🟢 ซื้อเลย! Sale ดีมาก!" : "🟡 รอก่อน!" }));
+  const deleteAccount = (id) => {
+    setAccounts(p => p.filter(a => a.id !== id));
+    setCollection(p => p.map(g => g.accountId === id ? { ...g, accountId:"" } : g));
+    showToast("🗑️ ลบ Account แล้ว");
+  };
+
+  // ── Game CRUD ────────────────────────────────────────────────────────────
+  const openAdd = () => {
+    setEditGame(null);
+    setNewGame({ ...EMPTY_GAME });
+    setSearchQ(""); setSearchResults([]);
+    setShowAddGame(true);
+  };
+
+  const openEdit = (game) => {
+    setEditGame(game);
+    setNewGame({ ...game, buyPrice: String(game.buyPrice) });
+    setSearchQ(game.title); setSearchResults([]);
+    setShowAddGame(true);
+  };
+
+  const saveGame = () => {
+    if (!newGame.title.trim() || !newGame.buyPrice) return;
+    const game = { ...newGame, buyPrice: parseFloat(newGame.buyPrice) };
+    if (editGame) {
+      setCollection(p => p.map(g => g.id === editGame.id ? { ...game, id:editGame.id } : g));
+      showToast("✅ แก้ไขแล้ว!", "#4ade80");
+    } else {
+      setCollection(p => [...p, { ...game, id: Date.now().toString() }]);
+      showToast("✅ เพิ่มเกมแล้ว!", "#4ade80");
     }
-    setAiLoading(null);
+    setShowAddGame(false); setEditGame(null);
+    setNewGame({ ...EMPTY_GAME }); setSearchQ("");
   };
 
-  const sendLine = async () => {
-    if (!lineToken) { setShowLineModal(true); return; }
-    setLineSending(true);
-    try {
-      await sendLineMessage(lineToken, games.filter(g => lineAlerts.includes(g.id)));
-      showToast("✅ ส่ง LINE สำเร็จ!", "#4ade80");
-    } catch {
-      showToast("❌ ส่ง LINE ไม่ได้ ตรวจสอบ Token ด้วย", "#f87171");
-    }
-    setLineSending(false);
+  const deleteGame = (id) => {
+    setCollection(p => p.filter(g => g.id !== id));
+    showToast("🗑️ ลบเกมแล้ว");
   };
 
-  const wishGames = games.filter(g => wishlist.includes(g.id));
-  const wishTotal = wishGames.reduce((s, g) => s + (g.sale_price || g.msrp || 0), 0);
-  const wishSave  = wishGames.reduce((s, g) => s + (g.on_sale ? (g.msrp - g.sale_price) : 0), 0);
-  const filtered  = games.filter(g => genre === "All" || g.genre === genre);
-  const hasMore   = games.length < total && !debouncedQ;
+  // ── When zone changes, auto-set currency ─────────────────────────────────
+  const handleZoneChange = (zone) => {
+    const iso = ZONE_CURRENCY[zone] || "THB";
+    setNewGame(p => ({ ...p, eshopZone: zone, currency: iso }));
+  };
 
+  // ── Derived data ─────────────────────────────────────────────────────────
+  const accOf  = (id) => accounts.find(a => a.id === id);
+  const gameTHB = (g)  => toTHB(g.buyPrice, g.currency);
+
+  const filtered = collection
+    .filter(g => filterAcc  === "all" || g.accountId === filterAcc)
+    .filter(g => filterType === "all" || g.type      === filterType)
+    .sort((a, b) => {
+      if (sortBy === "title")  return a.title.localeCompare(b.title);
+      if (sortBy === "price")  return gameTHB(b) - gameTHB(a);
+      return (b.bought || "").localeCompare(a.bought || "");
+    });
+
+  const totalTHB = collection.reduce((s, g) => s + gameTHB(g), 0);
+  const physTHB  = collection.filter(g=>g.type==="physical").reduce((s,g)=>s+gameTHB(g),0);
+  const digTHB   = collection.filter(g=>g.type==="digital" ).reduce((s,g)=>s+gameTHB(g),0);
+
+  // by account
+  const byAccount = accounts.map(acc => ({
+    ...acc,
+    games: collection.filter(g => g.accountId === acc.id),
+    thb:   collection.filter(g => g.accountId === acc.id).reduce((s,g)=>s+gameTHB(g),0),
+  }));
+  const unassigned = collection.filter(g => !g.accountId || !accounts.find(a=>a.id===g.accountId));
+  const unassignedTHB = unassigned.reduce((s,g)=>s+gameTHB(g),0);
+
+  // by eShop zone (digital)
+  const byZone = ESHOP_ZONES.map(z => {
+    const games = collection.filter(g => g.type==="digital" && g.eshopZone===z);
+    return { zone:z, games, thb: games.reduce((s,g)=>s+gameTHB(g),0) };
+  }).filter(z => z.games.length > 0);
+
+  // by physical region
+  const byRegion = PHYS_REGIONS.map(r => {
+    const games = collection.filter(g => g.type==="physical" && g.physRegion===r);
+    return { region:r, games, thb: games.reduce((s,g)=>s+gameTHB(g),0) };
+  }).filter(r => r.games.length > 0);
+
+  // ─────────────────────────────────────────────────────────────────────────
   return (
-    <div style={{ minHeight: "100vh", background: "#080810", fontFamily: "'Noto Sans Thai','IBM Plex Sans',sans-serif", color: "#f0f0f8", maxWidth: 430, margin: "0 auto" }}>
+    <div style={{ minHeight:"100vh", background:"#07080f", color:"#eef0f8", fontFamily:"'Noto Sans Thai','DM Sans',sans-serif", maxWidth:430, margin:"0 auto" }}>
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600;700;800&family=Black+Han+Sans&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600;700;800&family=Syne:wght@700;800&family=DM+Mono:wght@400;500&display=swap');
         *{box-sizing:border-box;margin:0;padding:0;}
         ::-webkit-scrollbar{display:none;}
-        .c{transition:transform .14s;}.c:active{transform:scale(.96);}
-        .b{transition:all .14s;cursor:pointer;font-family:inherit;border:none;}.b:active{transform:scale(.91);}
-        .s{animation:su .28s ease both;}@keyframes su{from{transform:translateY(12px);opacity:0}to{transform:translateY(0);opacity:1}}
-        .f{animation:fi .3s ease;}@keyframes fi{from{opacity:0}to{opacity:1}}
+        .b{transition:all .13s ease;cursor:pointer;font-family:inherit;border:none;}.b:active{transform:scale(.92);}
+        .c{transition:transform .14s ease;}.c:active{transform:scale(.97);}
+        .s{animation:su .28s cubic-bezier(.34,1.56,.64,1) both;}
+        @keyframes su{from{transform:translateY(12px) scale(.97);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}
+        .f{animation:fi .28s ease;}@keyframes fi{from{opacity:0}to{opacity:1}}
         .p{animation:pu 1.8s infinite;}@keyframes pu{0%,100%{opacity:1}50%{opacity:.3}}
-        .sale{animation:sg 2s infinite;}@keyframes sg{0%,100%{box-shadow:0 0 0 0 rgba(234,179,8,.3)}60%{box-shadow:0 0 0 6px rgba(234,179,8,0)}}
-        .spin{animation:sp 1s linear infinite;display:inline-block;}@keyframes sp{to{transform:rotate(360deg)}}
-        .sk{background:linear-gradient(90deg,rgba(255,255,255,.04) 25%,rgba(255,255,255,.09) 50%,rgba(255,255,255,.04) 75%);background-size:200% 100%;animation:sk 1.4s infinite;}@keyframes sk{0%{background-position:-200% 0}100%{background-position:200% 0}}
-        input{outline:none;}
+        .shine{background:linear-gradient(105deg,transparent 40%,rgba(255,255,255,.06) 50%,transparent 60%);background-size:200% 100%;animation:shine 3s infinite;}
+        @keyframes shine{0%{background-position:200% 0}100%{background-position:-200% 0}}
+        input,select{outline:none;font-family:inherit;}
         .mbg{animation:fi .18s ease;}
-        a{text-decoration:none;}
+        .bar{transition:width 1s cubic-bezier(.4,0,.2,1);}
       `}</style>
 
       {/* ── HEADER ──────────────────────────────────────────── */}
-      <div style={{ background: "linear-gradient(155deg,#180b26 0%,#080810 65%)", padding: "50px 20px 18px", borderBottom: "1px solid rgba(255,255,255,.06)", position: "relative", overflow: "hidden" }}>
-        <div style={{ position: "absolute", top: -30, right: -30, width: 140, height: 140, borderRadius: "50%", background: "radial-gradient(circle,rgba(220,38,38,.2) 0%,transparent 70%)" }} />
+      <div style={{ background:"linear-gradient(160deg,#0e0b1f 0%,#07080f 65%)", padding:"50px 20px 0", position:"relative", overflow:"hidden" }}>
+        <div style={{ position:"absolute", top:-50, right:-50, width:180, height:180, borderRadius:"50%", background:"radial-gradient(circle,rgba(99,102,241,.15) 0%,transparent 70%)" }}/>
 
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", position: "relative" }}>
+        <div style={{ position:"relative", display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
           <div>
-            <div style={{ fontSize: 10, letterSpacing: 3, color: "#dc2626", fontWeight: 700, textTransform: "uppercase", marginBottom: 4 }}>🇹🇭 Nintendo eShop TH</div>
-            <div style={{ fontFamily: "'Black Han Sans',sans-serif", fontSize: 26, lineHeight: 1.1 }}>
-              ดีลสด<br /><span style={{ color: "#eab308" }}>eShop ไทย</span>
+            <div style={{ fontSize:10, letterSpacing:4, color:"#6366f1", fontWeight:700, textTransform:"uppercase", marginBottom:6 }}>🎮 Switch Collection</div>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontSize:26, fontWeight:800, lineHeight:1.1 }}>Game Value<br/><span style={{ color:"#eab308" }}>Tracker</span></div>
+          </div>
+          {/* Rates status */}
+          <div style={{ textAlign:"right", marginTop:4 }}>
+            <div style={{ fontSize:10, color: ratesErr?"#f87171": rates?"#4ade80":"#eab308", background: ratesErr?"rgba(248,113,113,.1)":rates?"rgba(74,222,128,.1)":"rgba(234,179,8,.1)", border:`1px solid ${ratesErr?"rgba(248,113,113,.25)":rates?"rgba(74,222,128,.25)":"rgba(234,179,8,.25)"}`, borderRadius:8, padding:"5px 9px", fontWeight:700 }}>
+              {ratesErr ? "⚠️ Rates fallback" : rates ? "💱 Live rates" : <span className="p">⏳ Loading...</span>}
+            </div>
+            {ratesAge && ratesAge !== "fallback" && <div style={{ fontSize:9, color:"#444", marginTop:3 }}>อัปเดต: {ratesAge?.slice(0,16)}</div>}
+          </div>
+        </div>
+
+        {/* Portfolio summary card */}
+        <div className="shine" style={{ background:"linear-gradient(135deg,rgba(99,102,241,.16),rgba(234,179,8,.07))", border:"1px solid rgba(99,102,241,.25)", borderRadius:18, padding:"16px 18px", margin:"16px 0 0", overflow:"hidden", position:"relative" }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+            <div>
+              <div style={{ fontSize:10, color:"#666", marginBottom:3 }}>มูลค่า Collection รวม (THB)</div>
+              <div style={{ fontFamily:"'Syne',sans-serif", fontSize:30, fontWeight:800 }}>{fmtTHB(totalTHB)}</div>
+              <div style={{ fontSize:11, color:"#555", marginTop:4 }}>{collection.length} เกม · {accounts.length} บัญชี</div>
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
+              <div style={{ background:"rgba(245,158,11,.1)", borderRadius:10, padding:"8px 10px", textAlign:"center" }}>
+                <div style={{ fontFamily:"'Syne',sans-serif", fontSize:16, fontWeight:800, color:"#f59e0b" }}>{collection.filter(g=>g.type==="physical").length}</div>
+                <div style={{ fontSize:9, color:"#666", marginTop:1 }}>Physical</div>
+                <div style={{ fontSize:10, color:"#f59e0b", marginTop:1 }}>{fmtTHB(physTHB)}</div>
+              </div>
+              <div style={{ background:"rgba(96,165,250,.1)", borderRadius:10, padding:"8px 10px", textAlign:"center" }}>
+                <div style={{ fontFamily:"'Syne',sans-serif", fontSize:16, fontWeight:800, color:"#60a5fa" }}>{collection.filter(g=>g.type==="digital").length}</div>
+                <div style={{ fontSize:9, color:"#666", marginTop:1 }}>Digital</div>
+                <div style={{ fontSize:10, color:"#60a5fa", marginTop:1 }}>{fmtTHB(digTHB)}</div>
+              </div>
             </div>
           </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 7, alignItems: "flex-end" }}>
-            <button className="b" onClick={() => load(0, true)} disabled={loading} style={{ background: "rgba(255,255,255,.06)", border: "1px solid rgba(74,222,128,.4)", borderRadius: 10, padding: "7px 11px", fontSize: 10, fontWeight: 700, color: "#4ade80", display: "flex", alignItems: "center", gap: 5 }}>
-              {loading ? <span className="spin">⚙️</span> : "🔄"} {loading ? "กำลังโหลด..." : total > 0 ? `${total} เกม` : "โหลด"}
-            </button>
-            <button className="b" onClick={() => setShowLineModal(true)} style={{ background: lineToken ? "rgba(6,199,85,.12)" : "rgba(255,255,255,.05)", border: `1px solid ${lineToken ? "rgba(6,199,85,.3)" : "rgba(255,255,255,.1)"}`, borderRadius: 10, padding: "7px 11px", fontSize: 10, fontWeight: 700, color: lineToken ? "#4ade80" : "#777", display: "flex", alignItems: "center", gap: 5 }}>
-              {lineToken ? "🔔" : "🔕"} LINE {lineToken ? `(${lineAlerts.length})` : "Alert"}
-            </button>
-          </div>
         </div>
 
-        {/* Mode tabs */}
-        <div style={{ display: "flex", gap: 6, marginTop: 14 }}>
-          {[["sales", "🔥 Sale"], ["new", "✨ ใหม่"], ["ranking", "👑 Ranking"]].map(([k, l]) => (
-            <button key={k} className="b" onClick={() => setMode(k)} style={{ flex: 1, padding: "8px 4px", borderRadius: 10, fontSize: 11, fontWeight: 700, background: mode === k ? "rgba(220,38,38,.25)" : "rgba(255,255,255,.05)", color: mode === k ? "#ff6b6b" : "#666", border: mode === k ? "1px solid rgba(220,38,38,.4)" : "1px solid rgba(255,255,255,.07)" }}>{l}</button>
+        {/* Tabs */}
+        <div style={{ display:"flex", gap:4, marginTop:14 }}>
+          {[["collection","📦 Collection"],["summary","📊 Summary"],["accounts","👤 Accounts"]].map(([k,l]) => (
+            <button key={k} className="b" onClick={() => setTab(k)} style={{ flex:1, padding:"10px 4px", borderRadius:"12px 12px 0 0", fontSize:11, fontWeight:700, background:tab===k?"#07080f":"rgba(255,255,255,.04)", color:tab===k?"#eab308":"#555", border:tab===k?"1px solid rgba(99,102,241,.2)":"1px solid transparent", borderBottom:"none" }}>{l}</button>
           ))}
         </div>
-
-        {/* Budget */}
-        <div style={{ marginTop: 12, background: "rgba(255,255,255,.04)", borderRadius: 14, padding: "12px 14px", border: "1px solid rgba(255,255,255,.07)" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-            <span style={{ fontSize: 12, color: "#aaa" }}>งบเดือนนี้</span>
-            <input value={tempBudget} onChange={e => setTempBudget(e.target.value)} onBlur={() => { const v = parseInt(tempBudget); if (!isNaN(v)) setBudget(v); }}
-              style={{ background: "transparent", border: "none", color: "#eab308", fontWeight: 700, fontSize: 14, width: 80, textAlign: "right", fontFamily: "inherit" }} />
-          </div>
-          <input type="range" min={500} max={10000} step={100} value={budget}
-            onChange={e => { setBudget(+e.target.value); setTempBudget(String(e.target.value)); }}
-            style={{ width: "100%", accentColor: "#eab308", height: 4 }} />
-        </div>
-
-        {/* Stats */}
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 7, marginTop: 12 }}>
-          {[
-            { label: "เกมทั้งหมด", value: total || "...", color: "#a78bfa", icon: "🎮" },
-            { label: "Sale",       value: games.filter(g => g.on_sale).length, color: "#f97316", icon: "🔥" },
-            { label: "Wishlist",   value: wishlist.length, color: "#60a5fa", icon: "❤️" },
-            { label: "LINE",       value: lineAlerts.length, color: "#06c755", icon: "🔔" },
-          ].map((s, i) => (
-            <div key={i} style={{ background: "rgba(255,255,255,.04)", borderRadius: 11, padding: "9px 6px", textAlign: "center", border: "1px solid rgba(255,255,255,.06)" }}>
-              <div style={{ fontSize: 16 }}>{s.icon}</div>
-              <div style={{ fontSize: 17, fontWeight: 800, color: s.color }}>{s.value}</div>
-              <div style={{ fontSize: 9, color: "#555", marginTop: 1 }}>{s.label}</div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* ── TABS ───────────────────────────────────────────── */}
-      <div style={{ display: "flex", padding: "12px 20px 0", gap: 6 }}>
-        {[["deals", "🎮 ดีล"], ["wishlist", "❤️ Wishlist"], ["alerts", "🔔 LINE"]].map(([k, l]) => (
-          <button key={k} className="b" onClick={() => setTab(k)} style={{ flex: 1, padding: "9px 4px", borderRadius: 10, fontSize: 11, fontWeight: 700, background: tab === k ? "#dc2626" : "rgba(255,255,255,.05)", color: tab === k ? "#fff" : "#666", boxShadow: tab === k ? "0 4px 12px rgba(220,38,38,.35)" : "none" }}>{l}</button>
-        ))}
       </div>
 
       {/* ── CONTENT ─────────────────────────────────────────── */}
-      <div style={{ padding: "14px 20px 100px" }}>
+      <div style={{ padding:"16px 20px 100px", borderTop:"1px solid rgba(99,102,241,.15)" }}>
 
-        {/* ═══ DEALS ═══════════════════════════════════════════ */}
-        {tab === "deals" && <div className="f">
+        {/* ════ COLLECTION ════════════════════════════════════ */}
+        {tab==="collection" && <div className="f">
 
-          {/* Search */}
-          <div style={{ background: "rgba(255,255,255,.05)", borderRadius: 12, padding: "10px 14px", marginBottom: 10, display: "flex", alignItems: "center", gap: 8, border: "1px solid rgba(255,255,255,.07)" }}>
-            <span>🔍</span>
-            <input value={searchQ} onChange={e => setSearchQ(e.target.value)} placeholder="ค้นหาเกม..." style={{ background: "none", border: "none", color: "#f0f0f8", fontSize: 14, flex: 1, fontFamily: "inherit" }} />
-            {searchQ && <button className="b" onClick={() => setSearchQ("")} style={{ background: "none", color: "#666", fontSize: 16, padding: 0 }}>✕</button>}
-          </div>
-
-          {/* Genre filter */}
-          <div style={{ display: "flex", gap: 6, overflowX: "auto", marginBottom: 12, paddingBottom: 4 }}>
-            {GENRES.map(g => (
-              <button key={g} className="b" onClick={() => setGenre(g)} style={{ flexShrink: 0, padding: "6px 12px", borderRadius: 20, fontSize: 11, fontWeight: 600, background: genre === g ? "rgba(255,255,255,.15)" : "rgba(255,255,255,.06)", color: genre === g ? "#fff" : "#777" }}>{g}</button>
+          {/* Filter chips */}
+          <div style={{ display:"flex", gap:5, marginBottom:10, overflowX:"auto", paddingBottom:2 }}>
+            {[["all","All"],["physical","📦"],["digital","💾"]].map(([k,l]) => (
+              <button key={k} className="b" onClick={() => setFilterType(k)} style={{ flexShrink:0, padding:"6px 12px", borderRadius:20, fontSize:11, fontWeight:700, background:filterType===k?"#6366f1":"rgba(255,255,255,.06)", color:filterType===k?"#fff":"#666" }}>{l}</button>
+            ))}
+            <div style={{ width:1, background:"rgba(255,255,255,.08)", flexShrink:0, margin:"0 2px" }}/>
+            <button className="b" onClick={()=>setFilterAcc("all")} style={{ flexShrink:0, padding:"6px 12px", borderRadius:20, fontSize:11, fontWeight:700, background:filterAcc==="all"?"rgba(255,255,255,.15)":"rgba(255,255,255,.06)", color:filterAcc==="all"?"#fff":"#666" }}>All</button>
+            {accounts.map(a => (
+              <button key={a.id} className="b" onClick={()=>setFilterAcc(a.id)} style={{ flexShrink:0, padding:"6px 12px", borderRadius:20, fontSize:11, fontWeight:700, background:filterAcc===a.id?a.color:"rgba(255,255,255,.06)", color:filterAcc===a.id?"#fff":"#888" }}>{a.tag||a.name}</button>
             ))}
           </div>
 
-          {/* Error */}
-          {error && (
-            <div style={{ background: "rgba(248,113,113,.08)", border: "1px solid rgba(248,113,113,.25)", borderRadius: 14, padding: 16, marginBottom: 12, textAlign: "center" }}>
-              <div style={{ fontSize: 28, marginBottom: 8 }}>⚠️</div>
-              <div style={{ fontSize: 13, fontWeight: 700, color: "#f87171" }}>Nintendo API Error</div>
-              <div style={{ fontSize: 11, color: "#888", marginTop: 4, marginBottom: 12 }}>{error}</div>
-              <div style={{ fontSize: 11, color: "#666", lineHeight: 1.7 }}>
-                ถ้าเห็นหน้านี้บน Vercel แสดงว่า proxy ทำงานอยู่แต่ Nintendo อาจ block<br />
-                ลอง refresh หรือรอสักครู่แล้วกด 🔄 อีกครั้ง
-              </div>
-              <button className="b" onClick={() => load(0, true)} style={{ marginTop: 12, background: "#dc2626", borderRadius: 10, padding: "8px 18px", fontSize: 12, fontWeight: 700, color: "#fff" }}>ลองใหม่</button>
+          {/* Sort + Add */}
+          <div style={{ display:"flex", gap:8, marginBottom:14 }}>
+            <select value={sortBy} onChange={e=>setSortBy(e.target.value)} style={{ flex:1, background:"rgba(255,255,255,.06)", border:"1px solid rgba(255,255,255,.1)", borderRadius:10, padding:"8px 10px", fontSize:11, color:"#aaa" }}>
+              <option value="bought">ซื้อล่าสุด</option>
+              <option value="title">ชื่อ A-Z</option>
+              <option value="price">ราคาสูงสุด (THB)</option>
+            </select>
+            <button className="b" onClick={openAdd} style={{ background:"#6366f1", borderRadius:10, padding:"8px 18px", fontSize:12, fontWeight:700, color:"#fff", boxShadow:"0 4px 14px rgba(99,102,241,.4)", flexShrink:0 }}>+ เพิ่มเกม</button>
+          </div>
+
+          {/* Empty */}
+          {filtered.length === 0 && (
+            <div style={{ textAlign:"center", padding:"50px 20px", color:"#555" }}>
+              <div style={{ fontSize:44, marginBottom:12 }}>📦</div>
+              <div style={{ fontSize:15, fontWeight:700 }}>{collection.length===0?"ยังไม่มีเกม":"ไม่พบเกมที่ตรงกัน"}</div>
+              <div style={{ fontSize:12, marginTop:6 }}>กด + เพิ่มเกม เพื่อเริ่ม track</div>
             </div>
           )}
 
-          {/* Skeletons */}
-          {loading && Array.from({ length: 8 }).map((_, i) => (
-            <div key={i} className="sk" style={{ borderRadius: 16, marginBottom: 10, height: 120 }} />
-          ))}
-
           {/* Game cards */}
-          {!loading && filtered.map((game, i) => {
-            const price   = game.sale_price || game.msrp;
-            const inWish  = wishlist.includes(game.id);
-            const hasAlt  = lineAlerts.includes(game.id);
-            const afford  = price > 0 && price <= budget;
-            const isExp   = expanded === game.id;
+          {filtered.map((game, i) => {
+            const acc   = accOf(game.accountId);
+            const sym   = CURRENCY_SYMBOL[game.currency] || "฿";
+            const thb   = gameTHB(game);
+            const isForeign = game.currency !== "THB";
             return (
-              <div key={game.id} className="c s" style={{ background: "rgba(255,255,255,.04)", border: `1px solid ${game.on_sale ? "rgba(234,179,8,.22)" : "rgba(255,255,255,.07)"}`, borderRadius: 16, marginBottom: 10, overflow: "hidden", animationDelay: `${Math.min(i, 10) * .04}s` }}>
-                {/* Banner */}
-                {game.banner && (
-                  <div style={{ height: 80, overflow: "hidden", position: "relative" }}>
-                    <img src={game.banner} alt={game.title} style={{ width: "100%", height: "100%", objectFit: "cover", opacity: .7 }} onError={e => e.target.style.display = "none"} />
-                    <div style={{ position: "absolute", inset: 0, background: "linear-gradient(to bottom, transparent 40%, rgba(8,8,16,.9))" }} />
+              <div key={game.id} className="c s" style={{ background:"rgba(255,255,255,.04)", border:"1px solid rgba(255,255,255,.08)", borderRadius:16, marginBottom:10, overflow:"hidden", animationDelay:`${Math.min(i,.12)*0.05}s` }}>
+                {game.cover && (
+                  <div style={{ height:68, overflow:"hidden", position:"relative" }}>
+                    <img src={game.cover} alt="" style={{ width:"100%", height:"100%", objectFit:"cover", opacity:.5 }} onError={e=>e.target.style.display="none"}/>
+                    <div style={{ position:"absolute", inset:0, background:"linear-gradient(to bottom,transparent 20%,rgba(7,8,15,.95))" }}/>
                   </div>
                 )}
-                <div style={{ padding: 14 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-                    <div style={{ flex: 1, paddingRight: 8 }}>
-                      <div style={{ fontSize: 14, fontWeight: 700, lineHeight: 1.25 }}>{game.emoji} {game.title}</div>
-                      <div style={{ display: "flex", gap: 5, marginTop: 4, flexWrap: "wrap", alignItems: "center" }}>
-                        <span style={{ fontSize: 10, color: "#888", background: "rgba(255,255,255,.07)", borderRadius: 6, padding: "2px 6px" }}>{game.genre}</span>
-                        {game.released && <span style={{ fontSize: 10, color: "#555" }}>{game.released.slice(0, 4)}</span>}
-                        {game.rating && <span style={{ fontSize: 10, color: "#f59e0b" }}>⭐ {game.rating.toFixed(1)}</span>}
+                <div style={{ padding:"12px 14px" }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:8 }}>
+                    <div style={{ flex:1, minWidth:0 }}>
+                      <div style={{ fontSize:14, fontWeight:700, lineHeight:1.25, marginBottom:5 }}>{game.title}</div>
+                      <div style={{ display:"flex", gap:5, flexWrap:"wrap" }}>
+                        <span style={{ fontSize:10, fontWeight:700, color:TYPE_COLOR[game.type], background:`${TYPE_COLOR[game.type]}18`, borderRadius:6, padding:"2px 7px" }}>
+                          {game.type==="physical"?"📦 Physical":"💾 Digital"}
+                        </span>
+                        <span style={{ fontSize:10, fontWeight:700, color:ZONE_COLOR[game.type==="digital"?game.eshopZone:"Other"]||"#94a3b8", background:"rgba(255,255,255,.06)", borderRadius:6, padding:"2px 7px" }}>
+                          🌏 {game.type==="digital"?game.eshopZone:game.physRegion}
+                        </span>
+                        {acc && <span style={{ fontSize:10, fontWeight:700, color:acc.color, background:`${acc.color}18`, borderRadius:6, padding:"2px 7px" }}>👤 {acc.tag||acc.name}</span>}
+                        {game.genres?.[0] && <span style={{ fontSize:10, color:"#555" }}>{game.genres[0]}</span>}
                       </div>
                     </div>
-                    <div style={{ display: "flex", gap: 5, flexShrink: 0 }}>
-                      <button className="b" onClick={() => toggleWishlist(game.id)} style={{ background: inWish ? "rgba(239,68,68,.2)" : "rgba(255,255,255,.07)", borderRadius: 8, padding: "5px 7px", fontSize: 14 }}>{inWish ? "❤️" : "🤍"}</button>
-                      <button className="b" onClick={() => toggleAlert(game.id)} style={{ background: hasAlt ? "rgba(6,199,85,.15)" : "rgba(255,255,255,.07)", borderRadius: 8, padding: "5px 7px", fontSize: 14 }}>{hasAlt ? "🔔" : "🔕"}</button>
+                    {/* Price — show original + THB if foreign */}
+                    <div style={{ textAlign:"right", flexShrink:0 }}>
+                      <div style={{ fontFamily:"'DM Mono',monospace", fontSize:16, fontWeight:500, color:"#eef0f8" }}>
+                        {fmtAmt(game.buyPrice, sym)}
+                      </div>
+                      {isForeign && (
+                        <div style={{ fontSize:11, color:"#6366f1", marginTop:2, fontFamily:"'DM Mono',monospace" }}>
+                          ≈ {fmtTHB(thb)}
+                        </div>
+                      )}
+                      {game.bought && <div style={{ fontSize:10, color:"#555", marginTop:2 }}>{game.bought}</div>}
                     </div>
                   </div>
-
-                  {/* Price */}
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10 }}>
-                    {price > 0 ? (
-                      <>
-                        <div style={{ fontFamily: "'Black Han Sans',sans-serif", fontSize: 20, color: afford ? "#4ade80" : "#f87171" }}>{fmt(price)}</div>
-                        {game.on_sale && <>
-                          <div style={{ fontSize: 12, color: "#555", textDecoration: "line-through" }}>{fmt(game.msrp)}</div>
-                          <div className="sale" style={{ fontSize: 10, background: "#eab308", color: "#000", borderRadius: 6, padding: "2px 7px", fontWeight: 800 }}>
-                            -{Math.round((1 - game.sale_price / game.msrp) * 100)}%
-                          </div>
-                        </>}
-                      </>
-                    ) : (
-                      <div style={{ fontSize: 13, color: "#888" }}>ไม่มีราคา (ลองกด 🔄 ใหม่)</div>
-                    )}
-                    <div style={{ marginLeft: "auto", fontSize: 10, color: "#e4000f", fontWeight: 700, background: "rgba(228,0,15,.1)", borderRadius: 6, padding: "2px 7px" }}>🎮 eShop TH</div>
+                  {game.notes && <div style={{ fontSize:11, color:"#666", marginTop:7, fontStyle:"italic" }}>"{game.notes}"</div>}
+                  <div style={{ display:"flex", gap:6, marginTop:10 }}>
+                    <button className="b" onClick={() => openEdit(game)} style={{ flex:1, background:"rgba(99,102,241,.1)", borderRadius:8, padding:"7px 0", fontSize:11, fontWeight:700, color:"#a5b4fc" }}>✏️ แก้ไข</button>
+                    <button className="b" onClick={() => deleteGame(game.id)} style={{ flex:1, background:"rgba(248,113,113,.08)", borderRadius:8, padding:"7px 0", fontSize:11, fontWeight:700, color:"#f87171" }}>🗑️ ลบ</button>
                   </div>
-                  {price > 0 && !afford && <div style={{ fontSize: 11, color: "#f87171", marginTop: 2 }}>เกินงบ {fmt(price - budget)}</div>}
-
-                  {/* Buy */}
-                  <a href={`https://www.nintendo.com/th/search/#q=${encodeURIComponent(game.title)}`} target="_blank" rel="noopener noreferrer"
-                    style={{ display: "block", marginTop: 10, background: game.on_sale ? "linear-gradient(135deg,#e4000f,#dc2626)" : "rgba(228,0,15,.13)", border: game.on_sale ? "none" : "1px solid rgba(228,0,15,.3)", borderRadius: 10, padding: "9px 0", fontSize: 12, fontWeight: 800, color: "#fff", textAlign: "center", boxShadow: game.on_sale ? "0 4px 14px rgba(220,38,38,.3)" : "none" }}>
-                    {game.on_sale ? `🛒 ซื้อเลย ${fmt(game.sale_price)} — Nintendo eShop TH →` : `🎮 ดูที่ Nintendo eShop TH →`}
-                  </a>
-
-                  {/* AI */}
-                  <button className="b" onClick={() => {
-                    if (isExp) setExpanded(null);
-                    else { setExpanded(game.id); if (!aiAdvice[game.id]) askAI(game); }
-                  }} style={{ marginTop: 8, width: "100%", background: "rgba(234,179,8,.08)", borderRadius: 8, padding: "6px 10px", fontSize: 11, color: "#eab308", fontWeight: 700 }}>
-                    {isExp ? "▲ ซ่อน" : aiLoading === game.id ? <span className="p">🤖 กำลังวิเคราะห์...</span> : "🤖 AI บอกว่าควรซื้อมั้ย?"}
-                  </button>
-                  {isExp && aiAdvice[game.id] && (
-                    <div style={{ marginTop: 8, background: "rgba(234,179,8,.07)", borderRadius: 10, padding: "9px 11px", border: "1px solid rgba(234,179,8,.2)", fontSize: 12, color: "#fde68a", lineHeight: 1.55 }}>
-                      {aiAdvice[game.id]}
-                    </div>
-                  )}
                 </div>
               </div>
             );
           })}
-
-          {/* Empty */}
-          {!loading && !error && filtered.length === 0 && games.length > 0 && (
-            <div style={{ textAlign: "center", padding: "40px 20px", color: "#555" }}>
-              <div style={{ fontSize: 40 }}>🔍</div>
-              <div style={{ fontSize: 14, fontWeight: 700, marginTop: 10 }}>ไม่พบเกมที่ตรงกัน</div>
-            </div>
-          )}
-
-          {/* First load */}
-          {!loading && !error && games.length === 0 && (
-            <div style={{ textAlign: "center", padding: "60px 20px" }}>
-              <div style={{ fontSize: 52, marginBottom: 16 }}>🎮</div>
-              <div style={{ fontFamily: "'Black Han Sans',sans-serif", fontSize: 20, marginBottom: 8 }}>ยินดีต้อนรับสู่ Switch2 TH Deals</div>
-              <div style={{ fontSize: 13, color: "#888", marginBottom: 22, lineHeight: 1.7 }}>
-                กดปุ่มด้านล่างเพื่อโหลดเกมทั้งหมด<br />
-                จาก Nintendo eShop Thailand โดยตรง
-              </div>
-              <button className="b" onClick={() => load(0, true)} style={{ background: "#dc2626", borderRadius: 14, padding: "14px 32px", fontSize: 15, fontWeight: 800, color: "#fff", boxShadow: "0 6px 20px rgba(220,38,38,.35)" }}>
-                🔄 โหลดเกมทั้งหมด
-              </button>
-            </div>
-          )}
-
-          {/* Load More */}
-          {!loading && hasMore && (
-            <button className="b" onClick={loadMore} disabled={loadingMore} style={{ width: "100%", padding: "13px 0", background: "rgba(255,255,255,.06)", borderRadius: 14, fontSize: 13, fontWeight: 700, color: loadingMore ? "#666" : "#ccc", marginTop: 4 }}>
-              {loadingMore ? <span className="p">⏳ กำลังโหลด...</span> : `โหลดเพิ่ม (${games.length}/${total}) →`}
-            </button>
-          )}
         </div>}
 
-        {/* ═══ WISHLIST ═══════════════════════════════════════ */}
-        {tab === "wishlist" && <div className="f">
-          {wishlist.length === 0 ? (
-            <div style={{ textAlign: "center", padding: "60px 20px", color: "#555" }}>
-              <div style={{ fontSize: 48, marginBottom: 12 }}>🤍</div>
-              <div style={{ fontSize: 16, fontWeight: 700 }}>ยังไม่มีเกมใน Wishlist</div>
-              <div style={{ fontSize: 13, marginTop: 6 }}>กดหัวใจที่ดีลเพื่อเพิ่ม</div>
+        {/* ════ SUMMARY ════════════════════════════════════════ */}
+        {tab==="summary" && <div className="f">
+
+          {/* Conversion notice */}
+          {!ratesErr && (
+            <div style={{ background:"rgba(99,102,241,.08)", border:"1px solid rgba(99,102,241,.2)", borderRadius:12, padding:"9px 12px", marginBottom:14, fontSize:11, color:"#a5b4fc" }}>
+              💱 ราคาทุกสกุลเงินแปลงเป็น THB แล้ว — {rates ? "อัตราแลกเปลี่ยนสด" : "อัตราโดยประมาณ"}
             </div>
-          ) : <>
-            <div style={{ background: "linear-gradient(135deg,rgba(220,38,38,.12),rgba(234,179,8,.06))", border: "1px solid rgba(220,38,38,.2)", borderRadius: 16, padding: 16, marginBottom: 14 }}>
-              <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 10 }}>📊 สรุป Wishlist</div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-                {[
-                  { label: "ราคารวม",        value: fmt(wishTotal),                                               color: "#f87171" },
-                  { label: "งบที่มี",         value: fmt(budget),                                                  color: "#4ade80" },
-                  { label: "ประหยัด Sale",   value: fmt(wishSave),                                               color: "#eab308" },
-                  { label: wishTotal <= budget ? "✅ ในงบ" : "เกินงบ", value: wishTotal <= budget ? "พอดี!" : fmt(wishTotal - budget), color: wishTotal <= budget ? "#4ade80" : "#f87171" },
-                ].map((s, i) => (
-                  <div key={i} style={{ background: "rgba(0,0,0,.3)", borderRadius: 10, padding: "8px 10px" }}>
-                    <div style={{ fontSize: 11, color: "#666" }}>{s.label}</div>
-                    <div style={{ fontSize: 15, fontWeight: 800, color: s.color, marginTop: 2 }}>{s.value}</div>
+          )}
+          {ratesErr && (
+            <div style={{ background:"rgba(234,179,8,.07)", border:"1px solid rgba(234,179,8,.2)", borderRadius:12, padding:"9px 12px", marginBottom:14, fontSize:11, color:"#fde68a" }}>
+              ⚠️ ใช้อัตราแลกเปลี่ยนโดยประมาณ (ไม่มีอินเทอร์เน็ต)
+            </div>
+          )}
+
+          {/* Total */}
+          <div style={{ background:"linear-gradient(135deg,rgba(99,102,241,.14),rgba(234,179,8,.06))", border:"1px solid rgba(99,102,241,.22)", borderRadius:18, padding:18, marginBottom:16 }}>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontSize:12, fontWeight:800, color:"#a5b4fc", marginBottom:12, letterSpacing:1, textTransform:"uppercase" }}>💰 รวมทั้งหมด (THB)</div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+              {[
+                { label:"ราคารวม",    value:fmtTHB(totalTHB),  color:"#eef0f8" },
+                { label:"จำนวนเกม",  value:`${collection.length} เกม`, color:"#a5b4fc" },
+                { label:"📦 Physical", value:fmtTHB(physTHB),  color:"#f59e0b" },
+                { label:"💾 Digital",  value:fmtTHB(digTHB),   color:"#60a5fa" },
+              ].map((s,i) => (
+                <div key={i} style={{ background:"rgba(0,0,0,.3)", borderRadius:12, padding:"10px 12px" }}>
+                  <div style={{ fontSize:10, color:"#555", marginBottom:3 }}>{s.label}</div>
+                  <div style={{ fontFamily:"'DM Mono',monospace", fontSize:14, fontWeight:500, color:s.color }}>{s.value}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* By Account */}
+          {byAccount.some(a=>a.games.length>0) && (
+            <>
+              <SectionTitle>👤 แยกตาม Account</SectionTitle>
+              {byAccount.filter(a=>a.games.length>0).map((acc,i)=>(
+                <SummaryRow key={acc.id} i={i} color={acc.color} label={acc.name} tag={acc.tag} count={acc.games.length} thb={acc.thb} total={totalTHB}/>
+              ))}
+              {unassigned.length>0 && (
+                <SummaryRow color="#444" label="ไม่ได้กำหนด" count={unassigned.length} thb={unassignedTHB} total={totalTHB}/>
+              )}
+            </>
+          )}
+
+          {/* By eShop Zone */}
+          {byZone.length>0 && (
+            <>
+              <SectionTitle style={{ marginTop:16 }}>🌏 แยกตาม eShop Zone (Digital)</SectionTitle>
+              {byZone.map((z,i)=>(
+                <SummaryRow key={z.zone} i={i} color={ZONE_COLOR[z.zone]||"#94a3b8"} label={`eShop ${z.zone}`} count={z.games.length} thb={z.thb} total={digTHB||1}
+                  extra={z.games.map(g=>`${CURRENCY_SYMBOL[g.currency]||"?"}${g.buyPrice}`).slice(0,3).join(" · ")}/>
+              ))}
+            </>
+          )}
+
+          {/* By Physical Region */}
+          {byRegion.length>0 && (
+            <>
+              <SectionTitle style={{ marginTop:16 }}>📀 แยกตาม Physical Region</SectionTitle>
+              {byRegion.map((r,i)=>(
+                <SummaryRow key={r.region} i={i} color="#f59e0b" label={r.region} count={r.games.length} thb={r.thb} total={physTHB||1}/>
+              ))}
+            </>
+          )}
+
+          {/* Conversion reference */}
+          {rates && (
+            <div style={{ marginTop:20, background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.07)", borderRadius:14, padding:14 }}>
+              <div style={{ fontSize:11, color:"#666", fontWeight:700, marginBottom:10, letterSpacing:1, textTransform:"uppercase" }}>อัตราแลกเปลี่ยนที่ใช้</div>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:6 }}>
+                {["JPY","USD","EUR","MXN","HKD","SGD","AUD","GBP","KRW"].map(iso => (
+                  <div key={iso} style={{ background:"rgba(255,255,255,.04)", borderRadius:8, padding:"6px 8px", textAlign:"center" }}>
+                    <div style={{ fontSize:10, color:"#666" }}>1 {iso}</div>
+                    <div style={{ fontFamily:"'DM Mono',monospace", fontSize:12, color:"#a5b4fc", marginTop:2 }}>
+                      ≈ ฿{(rates.rates[iso]||0).toFixed(2)}
+                    </div>
                   </div>
                 ))}
               </div>
             </div>
-            {wishGames.map((game, i) => {
-              const price = game.sale_price || game.msrp;
-              const afford = price > 0 && price <= budget;
-              return (
-                <div key={game.id} className="c s" style={{ background: "rgba(255,255,255,.04)", border: `1px solid ${afford ? "rgba(74,222,128,.2)" : "rgba(248,113,113,.2)"}`, borderRadius: 14, padding: "12px 14px", marginBottom: 8, display: "flex", alignItems: "center", gap: 12, animationDelay: `${i * .05}s` }}>
-                  <div style={{ fontSize: 24 }}>{game.emoji}</div>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 13, fontWeight: 700, lineHeight: 1.3 }}>{game.title}</div>
-                    <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4 }}>
-                      <span style={{ fontSize: 15, fontWeight: 800, color: afford ? "#4ade80" : "#f87171" }}>{price > 0 ? fmt(price) : "N/A"}</span>
-                      {game.on_sale && <span style={{ fontSize: 10, background: "#eab308", color: "#000", borderRadius: 6, padding: "2px 6px", fontWeight: 800 }}>-{Math.round((1 - game.sale_price / game.msrp) * 100)}%</span>}
-                    </div>
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                    <a href={`https://www.nintendo.com/th/search/#q=${encodeURIComponent(game.title)}`} target="_blank" rel="noopener noreferrer"
-                      style={{ background: "#e4000f", borderRadius: 10, padding: "8px 12px", fontSize: 11, fontWeight: 800, color: "#fff", textAlign: "center", boxShadow: "0 3px 10px rgba(228,0,15,.3)" }}>ซื้อ →</a>
-                    <button className="b" onClick={() => toggleWishlist(game.id)} style={{ background: "rgba(248,113,113,.12)", borderRadius: 8, padding: "5px 10px", fontSize: 11, color: "#f87171" }}>ลบ</button>
-                  </div>
-                </div>
-              );
-            })}
-          </>}
+          )}
+
+          {collection.length===0 && (
+            <div style={{ textAlign:"center", padding:"40px 20px", color:"#555" }}>
+              <div style={{ fontSize:40, marginBottom:10 }}>📊</div>
+              <div style={{ fontSize:14, fontWeight:700 }}>ยังไม่มีข้อมูล</div>
+            </div>
+          )}
         </div>}
 
-        {/* ═══ ALERTS ════════════════════════════════════════ */}
-        {tab === "alerts" && <div className="f">
-          <div style={{ background: lineToken ? "rgba(6,199,85,.07)" : "rgba(255,255,255,.03)", border: `1px solid ${lineToken ? "rgba(6,199,85,.25)" : "rgba(255,255,255,.09)"}`, borderRadius: 16, padding: 16, marginBottom: 14 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div>
-                <div style={{ fontWeight: 700, fontSize: 14 }}>🟢 LINE Messaging API</div>
-                <div style={{ fontSize: 12, color: "#888", marginTop: 3 }}>{lineToken ? "✅ ตั้งค่าแล้ว" : "ยังไม่ได้ตั้ง Token"}</div>
-              </div>
-              <button className="b" onClick={() => setShowLineModal(true)} style={{ background: "#06c755", borderRadius: 10, padding: "8px 14px", fontSize: 12, fontWeight: 700, color: "#fff" }}>{lineToken ? "แก้ไข" : "ตั้งค่า"}</button>
-            </div>
-            {lineToken && (
-              <button className="b" onClick={sendLine} style={{ marginTop: 12, width: "100%", background: "#06c755", borderRadius: 12, padding: "11px", fontSize: 13, fontWeight: 700, color: "#fff" }}>
-                {lineSending ? <span className="p">📤 กำลังส่ง...</span> : `📤 ส่งสรุปดีลไป LINE (${lineAlerts.length} เกม)`}
+        {/* ════ ACCOUNTS ════════════════════════════════════════ */}
+        {tab==="accounts" && <div className="f">
+          <button className="b" onClick={()=>{setNewAcc({id:"",name:"",tag:"",color:"#6366f1"});setShowAddAcc(true);}} style={{ width:"100%", background:"#6366f1", borderRadius:12, padding:"12px 0", fontSize:13, fontWeight:700, color:"#fff", marginBottom:16, boxShadow:"0 4px 14px rgba(99,102,241,.4)" }}>+ สร้าง Account ใหม่</button>
+
+          <div style={{ fontSize:11, color:"#666", fontWeight:700, letterSpacing:1, textTransform:"uppercase", marginBottom:10 }}>Quick Add</div>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:16 }}>
+            {ACCOUNT_PRESETS.map((p,i) => (
+              <button key={i} className="b" onClick={() => {
+                if (accounts.find(a=>a.name===p.name)) return showToast("มีแล้ว!");
+                setAccounts(prev=>[...prev,{id:Date.now().toString(),...p}]);
+                showToast(`✅ เพิ่ม ${p.name}!`,"#4ade80");
+              }} style={{ background:`${p.color}14`, border:`1px solid ${p.color}33`, borderRadius:12, padding:"10px 8px", fontSize:11, fontWeight:700, color:p.color }}>
+                + {p.name}
               </button>
-            )}
+            ))}
           </div>
 
-          <div style={{ fontSize: 12, color: "#888", fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", marginBottom: 10 }}>เลือกเกมที่ต้องการแจ้งเตือน ({games.length} เกม)</div>
-          {games.length === 0 && <div style={{ textAlign: "center", padding: "30px", color: "#555", fontSize: 13 }}>โหลดเกมจากหน้า ดีล ก่อนนะ</div>}
-          {games.map((game, i) => (
-            <div key={game.id} className="s" style={{ background: "rgba(255,255,255,.04)", border: `1px solid ${lineAlerts.includes(game.id) ? "rgba(6,199,85,.25)" : "rgba(255,255,255,.07)"}`, borderRadius: 12, padding: "10px 14px", marginBottom: 8, display: "flex", alignItems: "center", gap: 12, animationDelay: `${i * .02}s` }}>
-              <div style={{ fontSize: 20 }}>{game.emoji}</div>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13, fontWeight: 600 }}>{game.title}</div>
-                <div style={{ fontSize: 11, color: "#666", marginTop: 2 }}>{game.on_sale ? `🔥 Sale ${fmt(game.sale_price)}` : game.msrp > 0 ? fmt(game.msrp) : "ไม่มีราคา"}</div>
-              </div>
-              {game.on_sale && <div style={{ fontSize: 10, background: "#eab308", color: "#000", borderRadius: 6, padding: "2px 6px", fontWeight: 800 }}>SALE</div>}
-              <button className="b" onClick={() => toggleAlert(game.id)} style={{ background: lineAlerts.includes(game.id) ? "#06c755" : "rgba(255,255,255,.07)", borderRadius: 20, padding: "6px 12px", fontSize: 11, fontWeight: 700, color: lineAlerts.includes(game.id) ? "#fff" : "#888" }}>
-                {lineAlerts.includes(game.id) ? "🔔 On" : "🔕 Off"}
-              </button>
+          <div style={{ fontSize:11, color:"#666", fontWeight:700, letterSpacing:1, textTransform:"uppercase", marginBottom:10 }}>Accounts ({accounts.length})</div>
+          {accounts.length===0 && (
+            <div style={{ textAlign:"center", padding:"40px 20px", color:"#555" }}>
+              <div style={{ fontSize:40, marginBottom:10 }}>👤</div>
+              <div style={{ fontSize:14, fontWeight:700 }}>ยังไม่มี Account</div>
             </div>
-          ))}
+          )}
+          {accounts.map((acc, i) => {
+            const gCount = collection.filter(g=>g.accountId===acc.id).length;
+            const thb    = collection.filter(g=>g.accountId===acc.id).reduce((s,g)=>s+gameTHB(g),0);
+            return (
+              <div key={acc.id} className="s" style={{ background:"rgba(255,255,255,.04)", border:`1px solid ${acc.color}33`, borderRadius:14, padding:"14px 16px", marginBottom:10, animationDelay:`${i*.05}s` }}>
+                <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+                  <div style={{ width:42, height:42, borderRadius:12, background:`${acc.color}22`, border:`2px solid ${acc.color}44`, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0, fontSize:18 }}>👤</div>
+                  <div style={{ flex:1 }}>
+                    <div style={{ fontSize:14, fontWeight:700 }}>{acc.name}</div>
+                    <div style={{ display:"flex", gap:6, marginTop:3, alignItems:"center" }}>
+                      {acc.tag && <span style={{ fontSize:10, color:acc.color, background:`${acc.color}18`, borderRadius:6, padding:"1px 6px", fontWeight:700 }}>{acc.tag}</span>}
+                      <span style={{ fontSize:10, color:"#555" }}>{gCount} เกม · {fmtTHB(thb)}</span>
+                    </div>
+                  </div>
+                  <button className="b" onClick={()=>deleteAccount(acc.id)} style={{ background:"rgba(248,113,113,.1)", borderRadius:8, padding:"6px 10px", fontSize:12, color:"#f87171" }}>🗑️</button>
+                </div>
+              </div>
+            );
+          })}
         </div>}
       </div>
 
-      {/* ── LINE MODAL ──────────────────────────────────────── */}
-      {showLineModal && (
-        <div className="mbg" onClick={() => setShowLineModal(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.85)", display: "flex", alignItems: "flex-end", zIndex: 100, backdropFilter: "blur(4px)" }}>
-          <div onClick={e => e.stopPropagation()} className="s" style={{ background: "#11101e", borderRadius: "24px 24px 0 0", padding: "28px 22px 40px", width: "100%", border: "1px solid rgba(255,255,255,.1)" }}>
-            <div style={{ fontFamily: "'Black Han Sans',sans-serif", fontSize: 20, marginBottom: 6 }}>🟢 ตั้งค่า LINE Alert</div>
-            <div style={{ fontSize: 12, color: "#888", marginBottom: 18, lineHeight: 1.6 }}>
-              วาง Channel Access Token จาก LINE Messaging API<br />
-              <a href="https://account.line.biz" target="_blank" style={{ color: "#06c755" }}>account.line.biz</a> → Messaging API → Issue Token
+      {/* ── ADD/EDIT GAME MODAL ──────────────────────────────── */}
+      {showAddGame && (
+        <div className="mbg" onClick={()=>{setShowAddGame(false);setEditGame(null);}} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.88)", display:"flex", alignItems:"flex-end", zIndex:100, backdropFilter:"blur(6px)" }}>
+          <div onClick={e=>e.stopPropagation()} className="s" style={{ background:"#0d0b1a", borderRadius:"24px 24px 0 0", padding:"22px 20px 36px", width:"100%", border:"1px solid rgba(99,102,241,.2)", maxHeight:"92vh", overflowY:"auto" }}>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontSize:18, fontWeight:800, marginBottom:16 }}>{editGame?"✏️ แก้ไขเกม":"🎮 เพิ่มเกมใหม่"}</div>
+
+            {/* RAWG search */}
+            <Label>ค้นหาเกม (ดึงจาก Nintendo Switch database)</Label>
+            <div style={{ position:"relative", marginBottom: searchResults.length>0?0:12 }}>
+              <input value={searchQ} onChange={e=>{setSearchQ(e.target.value);setNewGame(p=>({...p,title:e.target.value}));}}
+                placeholder="พิมพ์ชื่อเกม เช่น Mario, Zelda..."
+                style={{ width:"100%", background:"rgba(255,255,255,.07)", border:"1px solid rgba(255,255,255,.12)", borderRadius:12, padding:"11px 40px 11px 14px", fontSize:13, color:"#eef0f8" }}/>
+              {searching && <div className="p" style={{ position:"absolute", right:12, top:"50%", transform:"translateY(-50%)", fontSize:11, color:"#666" }}>🔍</div>}
             </div>
-            <input value={lineToken} onChange={e => setLineToken(e.target.value)} placeholder="eyJhbGciOiJIUzI1NiJ9..."
-              style={{ width: "100%", background: "rgba(255,255,255,.06)", border: "1px solid rgba(255,255,255,.1)", borderRadius: 12, padding: "12px 14px", fontSize: 13, color: "#f0f0f8", fontFamily: "inherit", marginBottom: 14 }} />
-            <button className="b" onClick={() => { localStorage.setItem("sw2_token", lineToken); setShowLineModal(false); showToast("✅ บันทึก Token แล้ว!", "#4ade80"); }}
-              style={{ width: "100%", padding: 14, background: "#06c755", borderRadius: 14, fontSize: 15, fontWeight: 700, color: "#fff" }}>บันทึก</button>
-            <div style={{ marginTop: 10, padding: "9px 12px", background: "rgba(234,179,8,.07)", borderRadius: 10, fontSize: 11, color: "#fde68a" }}>🔒 Token เก็บใน localStorage เท่านั้น</div>
+            {searchErr && <div style={{ fontSize:11, color:"#f87171", marginBottom:8 }}>{searchErr}</div>}
+            {searchResults.length>0 && (
+              <div style={{ background:"#13111f", border:"1px solid rgba(99,102,241,.25)", borderRadius:12, marginBottom:12, overflow:"hidden", maxHeight:220, overflowY:"auto" }}>
+                {searchResults.map(g=>(
+                  <div key={g.rawgId} className="b" onClick={()=>pickGame(g)} style={{ display:"flex", gap:10, padding:"9px 12px", borderBottom:"1px solid rgba(255,255,255,.05)", alignItems:"center" }}>
+                    {g.cover && <img src={g.cover} alt="" style={{ width:40, height:28, objectFit:"cover", borderRadius:6, flexShrink:0 }}/>}
+                    <div style={{ flex:1, minWidth:0 }}>
+                      <div style={{ fontSize:12, fontWeight:700, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{g.title}</div>
+                      <div style={{ fontSize:10, color:"#666", marginTop:2 }}>{g.released} · {g.genres?.join(", ")}</div>
+                    </div>
+                    {g.rating && <div style={{ fontSize:10, color:"#f59e0b", flexShrink:0 }}>⭐{g.rating}</div>}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Type */}
+            <Label>ประเภท</Label>
+            <div style={{ display:"flex", gap:8, marginBottom:12 }}>
+              {[["physical","📦 Physical"],["digital","💾 Digital"]].map(([k,l])=>(
+                <button key={k} className="b" onClick={()=>setNewGame(p=>({...p,type:k}))} style={{ flex:1, padding:"10px 0", borderRadius:10, fontSize:12, fontWeight:700, background:newGame.type===k?TYPE_COLOR[k]:"rgba(255,255,255,.06)", color:newGame.type===k?"#fff":"#888" }}>{l}</button>
+              ))}
+            </div>
+
+            {/* Zone */}
+            {newGame.type==="digital" && (
+              <>
+                <Label>🌏 eShop Zone → auto-set สกุลเงิน</Label>
+                <div style={{ display:"flex", gap:5, flexWrap:"wrap", marginBottom:12 }}>
+                  {ESHOP_ZONES.map(z=>(
+                    <button key={z} className="b" onClick={()=>handleZoneChange(z)} style={{ padding:"6px 11px", borderRadius:20, fontSize:11, fontWeight:700, background:newGame.eshopZone===z?(ZONE_COLOR[z]||"#94a3b8"):"rgba(255,255,255,.06)", color:newGame.eshopZone===z?"#fff":"#888" }}>{z}</button>
+                  ))}
+                </div>
+              </>
+            )}
+            {newGame.type==="physical" && (
+              <>
+                <Label>📀 Physical Region</Label>
+                <div style={{ display:"flex", gap:5, flexWrap:"wrap", marginBottom:12 }}>
+                  {PHYS_REGIONS.map(r=>(
+                    <button key={r} className="b" onClick={()=>setNewGame(p=>({...p,physRegion:r}))} style={{ padding:"6px 10px", borderRadius:20, fontSize:10, fontWeight:700, background:newGame.physRegion===r?"#f59e0b":"rgba(255,255,255,.06)", color:newGame.physRegion===r?"#000":"#888" }}>{r}</button>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {/* Price + Currency */}
+            <Label>ราคาที่ซื้อ</Label>
+            <div style={{ display:"grid", gridTemplateColumns:"90px 1fr", gap:8, marginBottom: rates&&newGame.currency!=="THB"?4:12 }}>
+              <select value={newGame.currency} onChange={e=>setNewGame(p=>({...p,currency:e.target.value}))} style={{ background:"rgba(255,255,255,.07)", border:"1px solid rgba(255,255,255,.12)", borderRadius:10, padding:"10px 8px", fontSize:13, color:"#eef0f8" }}>
+                {ALL_CURRENCIES.map(c=><option key={c}>{c}</option>)}
+              </select>
+              <input type="number" value={newGame.buyPrice} onChange={e=>setNewGame(p=>({...p,buyPrice:e.target.value}))} placeholder="เช่น 1990, 50, 3000"
+                style={{ background:"rgba(255,255,255,.07)", border:"1px solid rgba(255,255,255,.12)", borderRadius:10, padding:"10px 12px", fontSize:13, color:"#eef0f8" }}/>
+            </div>
+            {/* Live conversion preview */}
+            {rates && newGame.buyPrice && newGame.currency && newGame.currency!=="THB" && (
+              <div style={{ fontSize:11, color:"#6366f1", marginBottom:12, padding:"6px 10px", background:"rgba(99,102,241,.08)", borderRadius:8 }}>
+                💱 {CURRENCY_SYMBOL[newGame.currency]||""}{newGame.buyPrice} {newGame.currency} ≈ {fmtTHB(toTHB(newGame.buyPrice, newGame.currency))} THB
+              </div>
+            )}
+
+            {/* Account */}
+            <Label>👤 Account ที่ซื้อ (optional)</Label>
+            <div style={{ display:"flex", gap:5, flexWrap:"wrap", marginBottom:12 }}>
+              <button className="b" onClick={()=>setNewGame(p=>({...p,accountId:""}))} style={{ padding:"6px 12px", borderRadius:20, fontSize:11, fontWeight:700, background:!newGame.accountId?"rgba(255,255,255,.15)":"rgba(255,255,255,.06)", color:!newGame.accountId?"#fff":"#666" }}>ไม่ระบุ</button>
+              {accounts.map(a=>(
+                <button key={a.id} className="b" onClick={()=>setNewGame(p=>({...p,accountId:a.id}))} style={{ padding:"6px 12px", borderRadius:20, fontSize:11, fontWeight:700, background:newGame.accountId===a.id?a.color:"rgba(255,255,255,.06)", color:newGame.accountId===a.id?"#fff":"#888" }}>{a.tag||a.name}</button>
+              ))}
+              {accounts.length===0 && <div style={{ fontSize:11, color:"#555", padding:"6px 0" }}>ไปสร้าง Account ก่อนใน tab Accounts</div>}
+            </div>
+
+            {/* Condition + Date */}
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:12 }}>
+              {newGame.type==="physical" && (
+                <div>
+                  <Label>สภาพ</Label>
+                  <select value={newGame.condition} onChange={e=>setNewGame(p=>({...p,condition:e.target.value}))} style={{ width:"100%", background:"rgba(255,255,255,.07)", border:"1px solid rgba(255,255,255,.12)", borderRadius:10, padding:"10px 8px", fontSize:12, color:"#eef0f8" }}>
+                    <option value="new">ใหม่มือ 1</option>
+                    <option value="good">มือสอง - ดี</option>
+                    <option value="fair">มือสอง - พอใช้</option>
+                  </select>
+                </div>
+              )}
+              <div>
+                <Label>วันที่ซื้อ</Label>
+                <input type="month" value={newGame.bought} onChange={e=>setNewGame(p=>({...p,bought:e.target.value}))}
+                  style={{ width:"100%", background:"rgba(255,255,255,.07)", border:"1px solid rgba(255,255,255,.12)", borderRadius:10, padding:"10px 8px", fontSize:12, color:"#eef0f8" }}/>
+              </div>
+            </div>
+
+            {/* Notes */}
+            <Label>หมายเหตุ (optional)</Label>
+            <input value={newGame.notes} onChange={e=>setNewGame(p=>({...p,notes:e.target.value}))} placeholder="เช่น ซื้อตอน sale, ได้มาจากเพื่อน..."
+              style={{ width:"100%", background:"rgba(255,255,255,.07)", border:"1px solid rgba(255,255,255,.12)", borderRadius:10, padding:"10px 12px", fontSize:12, color:"#eef0f8", marginBottom:18 }}/>
+
+            <button className="b" onClick={saveGame} disabled={!newGame.title||!newGame.buyPrice} style={{ width:"100%", padding:14, background:newGame.title&&newGame.buyPrice?"linear-gradient(135deg,#6366f1,#8b5cf6)":"rgba(255,255,255,.06)", borderRadius:14, fontSize:15, fontWeight:700, color:newGame.title&&newGame.buyPrice?"#fff":"#444", boxShadow:newGame.title&&newGame.buyPrice?"0 6px 20px rgba(99,102,241,.35)":"none" }}>
+              {editGame?"💾 บันทึก":"✅ เพิ่มเกม"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── ADD ACCOUNT MODAL ───────────────────────────────── */}
+      {showAddAcc && (
+        <div className="mbg" onClick={()=>setShowAddAcc(false)} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.88)", display:"flex", alignItems:"flex-end", zIndex:100, backdropFilter:"blur(6px)" }}>
+          <div onClick={e=>e.stopPropagation()} className="s" style={{ background:"#0d0b1a", borderRadius:"24px 24px 0 0", padding:"24px 20px 36px", width:"100%", border:"1px solid rgba(99,102,241,.2)" }}>
+            <div style={{ fontFamily:"'Syne',sans-serif", fontSize:18, fontWeight:800, marginBottom:18 }}>👤 สร้าง Account</div>
+            {[{label:"ชื่อ Account",key:"name",placeholder:"เช่น บัญชีหลัก TH"},{label:"Tag (optional)",key:"tag",placeholder:"เช่น Main, JP"}].map(f=>(
+              <div key={f.key} style={{ marginBottom:12 }}>
+                <Label>{f.label}</Label>
+                <input value={newAcc[f.key]||""} onChange={e=>setNewAcc(p=>({...p,[f.key]:e.target.value}))} placeholder={f.placeholder}
+                  style={{ width:"100%", background:"rgba(255,255,255,.07)", border:"1px solid rgba(255,255,255,.12)", borderRadius:10, padding:"11px 12px", fontSize:13, color:"#eef0f8" }}/>
+              </div>
+            ))}
+            <Label>สี</Label>
+            <div style={{ display:"flex", gap:8, marginBottom:18 }}>
+              {["#6366f1","#dc2626","#e879f9","#3b82f6","#10b981","#f59e0b","#f97316","#ec4899"].map(c=>(
+                <button key={c} className="b" onClick={()=>setNewAcc(p=>({...p,color:c}))} style={{ width:28, height:28, borderRadius:"50%", background:c, border:newAcc.color===c?"3px solid #fff":"3px solid transparent" }}/>
+              ))}
+            </div>
+            <button className="b" onClick={addAccount} disabled={!newAcc.name} style={{ width:"100%", padding:14, background:newAcc.name?"linear-gradient(135deg,#6366f1,#8b5cf6)":"rgba(255,255,255,.06)", borderRadius:14, fontSize:15, fontWeight:700, color:newAcc.name?"#fff":"#444" }}>✅ สร้าง Account</button>
           </div>
         </div>
       )}
 
       {/* ── TOAST ───────────────────────────────────────────── */}
       {toast && (
-        <div className="s" style={{ position: "fixed", bottom: 90, left: "50%", transform: "translateX(-50%)", background: "#13111f", border: `1px solid ${toast.color}55`, borderRadius: 100, padding: "10px 20px", fontSize: 13, fontWeight: 700, color: toast.color, zIndex: 200, whiteSpace: "nowrap", boxShadow: "0 8px 28px rgba(0,0,0,.6)" }}>
+        <div className="s" style={{ position:"fixed", bottom:90, left:"50%", transform:"translateX(-50%)", background:"#0d0b1a", border:`1px solid ${toast.color}44`, borderRadius:100, padding:"10px 20px", fontSize:13, fontWeight:700, color:toast.color, zIndex:300, whiteSpace:"nowrap", boxShadow:"0 8px 28px rgba(0,0,0,.7)" }}>
           {toast.msg}
         </div>
       )}
 
       {/* ── BOTTOM NAV ──────────────────────────────────────── */}
-      <div style={{ position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 430, background: "rgba(8,8,16,.97)", borderTop: "1px solid rgba(255,255,255,.07)", padding: "10px 20px 24px", display: "flex", justifyContent: "space-around", backdropFilter: "blur(12px)", zIndex: 50 }}>
-        {[["deals", "🎮", "ดีล"], ["wishlist", "❤️", "Wishlist"], ["alerts", "🔔", "LINE"]].map(([k, ic, l]) => (
-          <button key={k} className="b" onClick={() => setTab(k)} style={{ background: "none", display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
-            <div style={{ fontSize: 20 }}>{ic}</div>
-            <div style={{ fontSize: 10, fontWeight: 700, color: tab === k ? "#dc2626" : "#444" }}>{l}</div>
+      <div style={{ position:"fixed", bottom:0, left:"50%", transform:"translateX(-50%)", width:"100%", maxWidth:430, background:"rgba(7,8,15,.97)", borderTop:"1px solid rgba(99,102,241,.12)", padding:"10px 20px 24px", display:"flex", justifyContent:"space-around", backdropFilter:"blur(14px)", zIndex:50 }}>
+        {[["collection","📦","Collection"],["summary","📊","Summary"],["accounts","👤","Accounts"]].map(([k,ic,l])=>(
+          <button key={k} className="b" onClick={()=>setTab(k)} style={{ background:"none", display:"flex", flexDirection:"column", alignItems:"center", gap:3 }}>
+            <div style={{ fontSize:20 }}>{ic}</div>
+            <div style={{ fontSize:10, fontWeight:700, color:tab===k?"#eab308":"#444" }}>{l}</div>
           </button>
         ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Small reusable components ──────────────────────────────────────────────
+function Label({ children }) {
+  return <div style={{ fontSize:11, color:"#888", fontWeight:700, marginBottom:6 }}>{children}</div>;
+}
+
+function SectionTitle({ children, style }) {
+  return <div style={{ fontSize:11, color:"#666", fontWeight:700, letterSpacing:1, textTransform:"uppercase", marginBottom:10, ...style }}>{children}</div>;
+}
+
+function SummaryRow({ color, label, tag, count, thb, total, extra, i=0 }) {
+  const pct = total ? Math.min(100, (thb/total)*100) : 0;
+  return (
+    <div className="s" style={{ background:"rgba(255,255,255,.04)", border:`1px solid ${color}28`, borderRadius:14, padding:"12px 14px", marginBottom:8, animationDelay:`${i*.04}s` }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          <div style={{ width:10, height:10, borderRadius:"50%", background:color, flexShrink:0 }}/>
+          <div style={{ fontSize:13, fontWeight:700 }}>{label}</div>
+          {tag && <div style={{ fontSize:10, color, background:`${color}18`, borderRadius:6, padding:"1px 6px", fontWeight:700 }}>{tag}</div>}
+        </div>
+        <div style={{ fontFamily:"'DM Mono',monospace", fontSize:14, color }}>{Math.round(thb).toLocaleString("th-TH")} ฿</div>
+      </div>
+      <div style={{ background:"rgba(255,255,255,.05)", borderRadius:100, height:4, marginBottom:5 }}>
+        <div className="bar" style={{ height:"100%", width:`${pct}%`, background:color, borderRadius:100 }}/>
+      </div>
+      <div style={{ display:"flex", justifyContent:"space-between" }}>
+        <div style={{ fontSize:11, color:"#555" }}>{count} เกม · {Math.round(pct)}%</div>
+        {extra && <div style={{ fontSize:10, color:"#555" }}>{extra}</div>}
       </div>
     </div>
   );
