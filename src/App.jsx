@@ -51,30 +51,39 @@ async function searchGames(q, offset = 0) {
   return res.json();
 }
 
-// Map Nintendo API game object → our app's shape
+// Map Nintendo/Algolia game object → our app's shape
+// Algolia response embeds _msrp/_sale/_on_sale directly — no separate price fetch needed
 function mapGame(item, priceMap = {}) {
   const nsuid = item.nsuid_txt?.[0] || item.id?.toString() || "";
-  const price  = priceMap[nsuid] || {};
-  const msrp   = price.regular_price  ? parseInt(price.regular_price.raw_value)  : null;
-  const sale   = price.discount_price ? parseInt(price.discount_price.raw_value) : null;
-  const onSale = price.sales_status === "onsale" && sale != null;
 
-  // Derive a genre from tags/categories if present
-  const tags   = item.tags || [];
-  const genre  = tags.find(t => GENRES.includes(t)) || "Action";
+  // Prefer embedded Algolia prices; fall back to separate price API map
+  let msrp, sale, onSale;
+  if (item._msrp != null) {
+    msrp   = item._msrp;
+    sale   = item._sale;
+    onSale = item._on_sale;
+  } else {
+    const price = priceMap[nsuid] || {};
+    msrp   = price.regular_price  ? parseInt(price.regular_price.raw_value)  : 0;
+    sale   = price.discount_price ? parseInt(price.discount_price.raw_value) : null;
+    onSale = price.sales_status === "onsale" && sale != null;
+  }
+
+  const tags  = item.tags || [];
+  const genre = tags.find(t => GENRES.includes(t)) || "Action";
 
   return {
-    id:       nsuid || item.id,
+    id:         nsuid || item.id,
     nsuid,
-    title:    item.formal_name || "Unknown",
+    title:      item.formal_name || "Unknown",
     genre,
-    emoji:    GENRE_EMOJI[genre] || "🎮",
-    banner:   item.hero_banner_url || null,
-    released: item.release_date_on_eshop || "",
-    msrp:     msrp || 0,
+    emoji:      GENRE_EMOJI[genre] || "🎮",
+    banner:     item.hero_banner_url || null,
+    released:   item.release_date_on_eshop || "",
+    msrp:       msrp || 0,
     sale_price: onSale ? sale : null,
-    on_sale:  onSale,
-    rating:   item.star_rating_info?.average_rating || null,
+    on_sale:    !!onSale,
+    rating:     item.star_rating_info?.average_rating || null,
   };
 }
 
@@ -180,12 +189,14 @@ export default function App() {
       const items = listData.contents || [];
       const totalCount = listData.total || items.length;
 
-      // 2. Fetch prices for all games in batch
-      const nsuids = items.map(g => g.nsuid_txt?.[0] || g.id?.toString()).filter(Boolean);
-      const prices = await fetchPrices(nsuids);
-      const priceMap = {};
-      for (const p of prices) {
-        priceMap[p.title_id?.toString()] = p;
+      // 2. Prices are now embedded in Algolia response (_msrp, _sale, _on_sale)
+      // Only fall back to separate price fetch if none have embedded prices
+      const needsPriceFetch = items.length > 0 && items[0]._msrp == null;
+      let priceMap = {};
+      if (needsPriceFetch) {
+        const nsuids = items.map(g => g.nsuid_txt?.[0] || g.id?.toString()).filter(Boolean);
+        const prices = await fetchPrices(nsuids);
+        for (const p of prices) priceMap[p.title_id?.toString()] = p;
       }
 
       // 3. Map to our shape
