@@ -207,8 +207,11 @@ export default function App() {
       if (reset) setGames(mapped);
       else setGames(prev => [...prev, ...mapped]);
     } catch (e) {
-      setError(e.message);
-      showToast("❌ โหลดเกมไม่ได้: " + e.message, "#f87171");
+      const msg = e.message?.includes("502")
+        ? "Nintendo API ไม่ตอบสนอง — ลองกด 🔄 อีกครั้ง"
+        : e.message;
+      setError(msg);
+      showToast("❌ " + msg, "#f87171");
     }
     setLoading(false);
     setLoadingMore(false);
